@@ -1,0 +1,135 @@
+---
+- name: Установка HAProxy на балансировщик
+  hosts: balancer
+  become: yes
+  tasks:
+    - name: Установить haproxy
+      apt:
+        name: haproxy
+        state: present
+        update_cache: yes
+
+    - name: Скопировать конфиг haproxy
+      template:
+        src: haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+
+    - name: Перезапустить haproxy
+      service:
+        name: haproxy
+        state: restarted
+
+- name: Установка Kubernetes и containerd на все узлы
+  hosts: masters,workers
+  become: yes
+  tasks:
+    - name: Установить зависимости
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Установить containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Создать директорию для ключей apt (если не существует)
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Скачать и добавить GPG-ключ Kubernetes
+      ansible.builtin.get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        mode: '0644'
+
+    - name: Добавить репозиторий Kubernetes (pkgs.k8s.io)
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: Установить kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Отключить swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Удалить swap из fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*swap.*)$'
+        replace: '# \1'
+
+- name: Инициализация master-ноды
+  hosts: masters[0]
+  become: yes
+  tasks:
+    - name: Инициализировать кластер
+      shell: |
+        kubeadm init --control-plane-endpoint="{{ hostvars['balancer1']['ansible_host'] }}:6443" --upload-certs --pod-network-cidr=10.244.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+
+    - name: Копировать kubeconfig в домашнюю директорию
+      shell: |
+        mkdir -p $HOME/.kube
+        cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+        chown $(id -u):$(id -g) $HOME/.kube/config
+
+    - name: Получить certificate-key
+      shell: kubeadm init phase upload-certs --upload-certs | grep -A1 "Using certificate key" | tail -n1
+      register: cert_key
+
+    - name: Получить join-команду для control-plane
+      shell: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Сохранить переменные для других нод
+      set_fact:
+        kube_join_command: "{{ join_command.stdout }}"
+        kube_cert_key: "{{ cert_key.stdout }}"
+
+- name: Присоединение остальных master-нод
+  hosts: masters[1:]
+  become: yes
+  tasks:
+    - name: Присоединить к кластеру как control-plane
+      shell: "{{ hostvars[groups['masters'][0]].kube_join_command }} --control-plane --certificate-key {{ hostvars[groups['masters'][0]].kube_cert_key }}"
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+- name: Присоединение воркеров
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Присоединить воркер к кластеру
+      shell: "{{ hostvars[groups['masters'][0]].kube_join_command }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+- name: Установить сетевой плагин (flannel)
+  hosts: masters[0]
+  become: yes
+  tasks:
+    - name: Установить flannel
+      shell: |
+        kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
